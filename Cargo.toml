@@ -2,13 +2,12 @@
 name = "tool-call-dedup"
 version = "0.1.0"
 edition = "2021"
-description = "Deduplicate repeated identical tool calls in AI agent loops"
+description = "Detect duplicate tool calls in agent runs to prevent wasted API spend"
 license = "MIT"
 repository = "https://github.com/MukundaKatta/tool-call-dedup-rs"
-keywords = ["agent", "tool", "dedup", "loop", "llm"]
-categories = ["api-bindings"]
+keywords = ["llm", "agent", "tools", "deduplication", "cache"]
+categories = ["text-processing"]
 exclude = ["target/*", ".github/*", "*.log"]
 
 [dependencies]
 serde_json = "1"
-sha2 = "0.10"

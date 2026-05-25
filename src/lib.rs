@@ -1,135 +1,103 @@
 /*!
-tool-call-dedup: deduplicate repeated identical tool calls in AI agent loops.
+tool-call-dedup: detect and skip duplicate tool calls in agent runs.
 
-Detects when an agent is calling the same tool with the same arguments in a
-rolling window. Use this alongside `llm-circuit-breaker` and `tool-loop-guard`
-to prevent runaway loops.
+An agent loop sometimes calls the same tool with the same arguments more
+than once. This crate records canonical (name, args) pairs and tells the
+caller whether a call is a duplicate so results can be served from cache
+or the call can be skipped entirely.
 
 ```rust
-use tool_call_dedup::ToolCallDedup;
+use tool_call_dedup::CallDedup;
 use serde_json::json;
 
-let mut dedup = ToolCallDedup::new(10);
-assert!(!dedup.is_duplicate("search", &json!({"q": "hello"})));
-dedup.record("search", &json!({"q": "hello"}));
-assert!(dedup.is_duplicate("search", &json!({"q": "hello"})));
+let mut dedup = CallDedup::new();
+assert!(!dedup.is_duplicate("search", &json!({"q": "rust"})));
+assert!(dedup.is_duplicate("search", &json!({"q": "rust"})));
 ```
 */
 
 use serde_json::Value;
-use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{HashMap, HashSet};
 
-// ---- canonical JSON for stable hashing ------------------------------------
+fn canonical_key(tool: &str, args: &Value) -> String {
+    format!("{}:{}", tool, canonical_json(args))
+}
 
-fn canonical_value(value: &Value) -> Value {
-    match value {
+fn canonical_json(v: &Value) -> String {
+    match v {
         Value::Object(m) => {
-            let sorted: BTreeMap<&String, &Value> = m.iter().collect();
-            let out: serde_json::Map<String, Value> = sorted
-                .into_iter()
-                .map(|(k, v)| (k.clone(), canonical_value(v)))
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            let pairs: Vec<String> = keys.iter()
+                .map(|k| format!("{}:{}", k, canonical_json(&m[*k])))
                 .collect();
-            Value::Object(out)
+            format!("{{{}}}", pairs.join(","))
         }
-        Value::Array(a) => Value::Array(a.iter().map(canonical_value).collect()),
-        other => other.clone(),
-    }
-}
-
-fn call_key(name: &str, args: &Value) -> String {
-    let canon = canonical_value(args);
-    let s = format!("{}:{}", name, serde_json::to_string(&canon).unwrap_or_default());
-    let mut h = Sha256::new();
-    h.update(s.as_bytes());
-    format!("{:x}", h.finalize())
-}
-
-// ---- DedupResult ----------------------------------------------------------
-
-/// Outcome of a `check()` call.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DedupResult {
-    /// This call has not been seen in the current window.
-    Novel,
-    /// This exact call was seen `count` times in the current window.
-    Duplicate { count: usize },
-}
-
-impl DedupResult {
-    pub fn is_duplicate(&self) -> bool {
-        matches!(self, DedupResult::Duplicate { .. })
-    }
-}
-
-// ---- ToolCallDedup --------------------------------------------------------
-
-/// Rolling-window deduplicator for agent tool calls.
-pub struct ToolCallDedup {
-    window: usize,
-    history: VecDeque<String>,
-}
-
-impl ToolCallDedup {
-    /// Create a deduplicator with a rolling window of `window` entries.
-    pub fn new(window: usize) -> Self {
-        Self {
-            window: window.max(1),
-            history: VecDeque::with_capacity(window),
+        Value::Array(a) => {
+            let items: Vec<String> = a.iter().map(canonical_json).collect();
+            format!("[{}]", items.join(","))
         }
+        other => other.to_string(),
+    }
+}
+
+/// Tracks seen (tool, args) pairs within a run.
+#[derive(Debug, Default)]
+pub struct CallDedup {
+    seen: HashSet<String>,
+    counts: HashMap<String, usize>,
+}
+
+impl CallDedup {
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// True if `(name, args)` appears in the current window (without recording it).
-    pub fn is_duplicate(&self, name: &str, args: &Value) -> bool {
-        let key = call_key(name, args);
-        self.history.contains(&key)
-    }
-
-    /// Count how many times `(name, args)` appears in the current window.
-    pub fn count(&self, name: &str, args: &Value) -> usize {
-        let key = call_key(name, args);
-        self.history.iter().filter(|k| *k == &key).count()
-    }
-
-    /// Record a call in the window (evicts oldest if full).
-    pub fn record(&mut self, name: &str, args: &Value) {
-        let key = call_key(name, args);
-        if self.history.len() == self.window {
-            self.history.pop_front();
+    /// Returns true if this exact call has been seen before; records it either way.
+    pub fn is_duplicate(&mut self, tool: &str, args: &Value) -> bool {
+        let key = canonical_key(tool, args);
+        let count = self.counts.entry(key.clone()).or_insert(0);
+        *count += 1;
+        if self.seen.contains(&key) {
+            return true;
         }
-        self.history.push_back(key);
+        self.seen.insert(key);
+        false
     }
 
-    /// Check if the call is a duplicate and record it atomically.
-    ///
-    /// Returns `DedupResult::Novel` if not seen before, or `DedupResult::Duplicate`
-    /// with the count of prior occurrences in this window.
-    pub fn check(&mut self, name: &str, args: &Value) -> DedupResult {
-        let count = self.count(name, args);
-        self.record(name, args);
-        if count == 0 {
-            DedupResult::Novel
-        } else {
-            DedupResult::Duplicate { count }
-        }
+    /// Record a call without checking for duplicates.
+    pub fn record(&mut self, tool: &str, args: &Value) {
+        self.is_duplicate(tool, args);
     }
 
-    /// Clear the window.
-    pub fn clear(&mut self) {
-        self.history.clear();
+    /// How many times has this exact call been seen?
+    pub fn call_count(&self, tool: &str, args: &Value) -> usize {
+        let key = canonical_key(tool, args);
+        *self.counts.get(&key).unwrap_or(&0)
     }
 
-    /// Number of entries currently in the window.
-    pub fn len(&self) -> usize {
-        self.history.len()
+    /// Total distinct calls recorded.
+    pub fn unique_count(&self) -> usize {
+        self.seen.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.history.is_empty()
+    /// Total calls recorded (including duplicates).
+    pub fn total_count(&self) -> usize {
+        self.counts.values().sum()
     }
 
-    pub fn window_size(&self) -> usize {
-        self.window
+    /// All duplicate counts (key -> count) where count > 1.
+    pub fn duplicates(&self) -> Vec<(String, usize)> {
+        self.counts.iter()
+            .filter(|(_, &c)| c > 1)
+            .map(|(k, &c)| (k.clone(), c))
+            .collect()
+    }
+
+    /// Clear all history.
+    pub fn reset(&mut self) {
+        self.seen.clear();
+        self.counts.clear();
     }
 }
 
@@ -139,120 +107,105 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn novel_first_call() {
-        let mut d = ToolCallDedup::new(10);
-        let r = d.check("search", &json!({"q": "hi"}));
-        assert_eq!(r, DedupResult::Novel);
+    fn first_call_not_duplicate() {
+        let mut d = CallDedup::new();
+        assert!(!d.is_duplicate("search", &json!({"q": "rust"})));
     }
 
     #[test]
-    fn duplicate_second_call() {
-        let mut d = ToolCallDedup::new(10);
-        d.record("search", &json!({"q": "hi"}));
-        assert!(d.is_duplicate("search", &json!({"q": "hi"})));
+    fn second_identical_call_is_duplicate() {
+        let mut d = CallDedup::new();
+        d.is_duplicate("search", &json!({"q": "rust"}));
+        assert!(d.is_duplicate("search", &json!({"q": "rust"})));
     }
 
     #[test]
     fn different_args_not_duplicate() {
-        let mut d = ToolCallDedup::new(10);
-        d.record("search", &json!({"q": "hi"}));
-        assert!(!d.is_duplicate("search", &json!({"q": "bye"})));
+        let mut d = CallDedup::new();
+        d.is_duplicate("search", &json!({"q": "rust"}));
+        assert!(!d.is_duplicate("search", &json!({"q": "python"})));
     }
 
     #[test]
-    fn different_name_not_duplicate() {
-        let mut d = ToolCallDedup::new(10);
-        d.record("search", &json!({"q": "hi"}));
-        assert!(!d.is_duplicate("fetch", &json!({"q": "hi"})));
+    fn different_tool_same_args_not_duplicate() {
+        let mut d = CallDedup::new();
+        d.is_duplicate("search", &json!({"q": "rust"}));
+        assert!(!d.is_duplicate("lookup", &json!({"q": "rust"})));
     }
 
     #[test]
-    fn check_returns_duplicate_on_second() {
-        let mut d = ToolCallDedup::new(10);
-        d.check("search", &json!({}));
-        let r = d.check("search", &json!({}));
-        assert_eq!(r, DedupResult::Duplicate { count: 1 });
+    fn call_count_tracks_repeats() {
+        let mut d = CallDedup::new();
+        d.is_duplicate("fetch", &json!({"url": "http://example.com"}));
+        d.is_duplicate("fetch", &json!({"url": "http://example.com"}));
+        d.is_duplicate("fetch", &json!({"url": "http://example.com"}));
+        assert_eq!(d.call_count("fetch", &json!({"url": "http://example.com"})), 3);
     }
 
     #[test]
-    fn count_matches_occurrences() {
-        let mut d = ToolCallDedup::new(10);
-        d.record("t", &json!(1));
-        d.record("t", &json!(1));
-        d.record("t", &json!(1));
-        assert_eq!(d.count("t", &json!(1)), 3);
+    fn unique_count() {
+        let mut d = CallDedup::new();
+        d.is_duplicate("a", &json!({}));
+        d.is_duplicate("b", &json!({}));
+        d.is_duplicate("a", &json!({})); // duplicate
+        assert_eq!(d.unique_count(), 2);
     }
 
     #[test]
-    fn window_evicts_oldest() {
-        let mut d = ToolCallDedup::new(3);
-        d.record("t", &json!(1)); // evicted after 3 more
-        d.record("t", &json!(2));
-        d.record("t", &json!(3));
-        d.record("t", &json!(4)); // evicts json!(1)
-        assert!(!d.is_duplicate("t", &json!(1)));
-        assert!(d.is_duplicate("t", &json!(2)));
+    fn total_count_includes_duplicates() {
+        let mut d = CallDedup::new();
+        d.is_duplicate("a", &json!({}));
+        d.is_duplicate("a", &json!({}));
+        d.is_duplicate("b", &json!({}));
+        assert_eq!(d.total_count(), 3);
     }
 
     #[test]
-    fn clear_resets() {
-        let mut d = ToolCallDedup::new(10);
-        d.record("t", &json!(1));
-        d.clear();
-        assert!(!d.is_duplicate("t", &json!(1)));
-        assert!(d.is_empty());
+    fn duplicates_list() {
+        let mut d = CallDedup::new();
+        d.is_duplicate("a", &json!({}));
+        d.is_duplicate("a", &json!({}));
+        d.is_duplicate("b", &json!({}));
+        let dups = d.duplicates();
+        assert_eq!(dups.len(), 1);
+        assert!(dups[0].1 > 1);
     }
 
     #[test]
-    fn len_tracks_entries() {
-        let mut d = ToolCallDedup::new(10);
-        assert_eq!(d.len(), 0);
-        d.record("t", &json!(1));
-        d.record("t", &json!(2));
-        assert_eq!(d.len(), 2);
+    fn key_ordering_is_canonical() {
+        let mut d = CallDedup::new();
+        d.is_duplicate("get", &json!({"b": 2, "a": 1}));
+        // Same args different insertion order
+        assert!(d.is_duplicate("get", &json!({"a": 1, "b": 2})));
     }
 
     #[test]
-    fn len_capped_at_window() {
-        let mut d = ToolCallDedup::new(3);
-        for i in 0..10u32 {
-            d.record("t", &json!(i));
-        }
-        assert_eq!(d.len(), 3);
+    fn reset_clears_state() {
+        let mut d = CallDedup::new();
+        d.is_duplicate("x", &json!(null));
+        d.reset();
+        assert!(!d.is_duplicate("x", &json!(null)));
+        assert_eq!(d.unique_count(), 1);
     }
 
     #[test]
-    fn key_order_independent() {
-        let mut d = ToolCallDedup::new(10);
-        d.record("t", &json!({"b": 2, "a": 1}));
-        assert!(d.is_duplicate("t", &json!({"a": 1, "b": 2})));
+    fn null_args() {
+        let mut d = CallDedup::new();
+        assert!(!d.is_duplicate("ping", &Value::Null));
+        assert!(d.is_duplicate("ping", &Value::Null));
     }
 
     #[test]
-    fn is_duplicate_does_not_record() {
-        let d = ToolCallDedup::new(10);
-        d.is_duplicate("t", &json!({}));
-        assert_eq!(d.len(), 0);
+    fn array_args_canonical() {
+        let mut d = CallDedup::new();
+        d.is_duplicate("list", &json!([1, 2, 3]));
+        assert!(d.is_duplicate("list", &json!([1, 2, 3])));
     }
 
     #[test]
-    fn dedup_result_is_duplicate_method() {
-        assert!(DedupResult::Duplicate { count: 2 }.is_duplicate());
-        assert!(!DedupResult::Novel.is_duplicate());
-    }
-
-    #[test]
-    fn window_size_accessor() {
-        let d = ToolCallDedup::new(5);
-        assert_eq!(d.window_size(), 5);
-    }
-
-    #[test]
-    fn window_1_always_evicts() {
-        let mut d = ToolCallDedup::new(1);
-        d.record("t", &json!(1));
-        d.record("t", &json!(2)); // evicts json!(1)
-        assert!(!d.is_duplicate("t", &json!(1)));
-        assert!(d.is_duplicate("t", &json!(2)));
+    fn record_without_return() {
+        let mut d = CallDedup::new();
+        d.record("ping", &json!({}));
+        assert!(d.is_duplicate("ping", &json!({})));
     }
 }
